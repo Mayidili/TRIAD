@@ -1,228 +1,186 @@
 """
-TS-NSGA-II -- Ming, Gong & Wang, "A Two-Stage Evolutionary Algorithm With
-Balanced Convergence and Diversity for Many-Objective Optimization",
-IEEE Trans. Systems, Man, and Cybernetics: Systems, 52(10):6222-6234, 2022.
-DOI: 10.1109/TSMC.2022.3143657.
+TS-NSGA-II: F. Ming, W. Gong and L. Wang, "A Two-Stage Evolutionary Algorithm With Balanced Convergence and
+Diversity for Many-Objective Optimization", IEEE Trans. Systems, Man, and Cybernetics: Systems, 52(10):6222-6234, 2022.
 
-Two dominance relations, two-stage environmental selection and a dedicated mating selection
-(Algorithms 1-4 of the paper):
-  Stage 1 (convergence): SPD (sub-region PBI dominance) -- solutions in the same reference-direction
-    sub-region are ordered by PBI, solutions in different sub-regions are incomparable; the last front is
-    truncated by d2 (PBI perpendicular distance), smaller kept first.
-  Stage 2 (diversity): LPD (level-based Pareto dominance) -- Pareto dominance first, ties between
-    Pareto-equivalent solutions broken by grid level; selection finishes by picking one solution per
-    reference direction.
-  Stage switch: I_stage=1 if g < (1-3/(η·m))×G_max, otherwise 2 (η=5, the paper's best setting).
+Line-by-line port of the reference implementation written by the first author for PlatEMO
+(BIMK/PlatEMO, Algorithms/Multi-objective optimization/TS-NSGA-II: TSNSGAII.m, EnvironmentalSelection.m,
+EnvironmentalSelection1.m, SPDSort.m, LevelSort.m, DensityEstimate.m).
 
-Note: line 23 of Algorithm 2 reads x_closest = argmin_x D(x,w) with D defined as cosine similarity;
-taken literally, argmin picks the solution with the largest angle, contradicting "closest". This
-implementation follows the intended meaning (smallest angle, i.e. largest cosine similarity) and treats
-the pseudo-code as a typo.
+Stage 1 (FE < (0.8 + 0.2 (1 - 3/M)) maxFE): min-max normalization of the merged population, association with the
+reference vector of smallest perpendicular distance d2, d1 = d2 = 0 for the extreme non-dominated solutions, SPD
+sorting (Pareto dominance; for non-dominated pairs in the same sub-region, the smaller PBI = d1 + 5 d2 wins), last
+front truncated by ascending d2. Mating: binary tournament on front number, then d2.
+Stage 2: Pareto fronts merged until >= N, ordered by LevelSort, then for each reference vector the remaining
+solution with the largest cosine (after min-max normalization of the remaining set) is selected. Mating: front
+number from non-dominated sorting, then sub-region density.
+Two guards stop loops that never terminate in the original code: the level is capped at n (relevant when the
+range of an objective underflows to zero), and a sorting pass that assigns no solution places the rest in one front.
 """
 import numpy as np
 from pymoo.algorithms.moo.nsga2 import NSGA2
 from pymoo.core.survival import Survival
-from pymoo.operators.selection.tournament import TournamentSelection
+from pymoo.util.nds.non_dominated_sorting import NonDominatedSorting
 
-from prism.ec.common import (
-    associate_to_reference_points,
-    fast_non_dominated_sort_from_matrix,
-    normalize_ideal_nadir,
-    pareto_relation_matrix,
-    rank_from_fronts,
-    truncate_by_score,
-)
-
-THETA_PBI = 5.0
-ETA_STAGE = 5
-N_P_LEVELS = None  # None means 2*n_obj, see TS_NSGA2.__init__
+EPS = 1e-12
 
 
-def _compute_pbi(Fn, assoc, ref_dirs, theta=THETA_PBI, eps=1e-12):
-    w = ref_dirs[assoc]
-    w_norm = np.maximum(np.linalg.norm(w, axis=1, keepdims=True), eps)
-    w_unit = w / w_norm
-    d1 = np.sum(Fn * w_unit, axis=1)
-    d2 = np.linalg.norm(Fn - d1[:, None] * w_unit, axis=1)
-    pbi = d1 + theta * d2
-    return d1, d2, pbi
+def _minmax(F):
+    zmin, zmax = F.min(axis=0), F.max(axis=0)
+    return (F - zmin) / np.maximum(zmax - zmin, EPS)
 
 
-def _spd_fronts(assoc, pbi, n_ref):
-    """Total order by ascending PBI within each sub-region, incomparable across sub-regions;
-    global front k is the union of the k-th ranked members of all sub-regions."""
-    groups = []
-    for r in range(n_ref):
-        idx = np.where(assoc == r)[0]
-        if len(idx) == 0:
-            continue
-        groups.append(idx[np.argsort(pbi[idx])])
-    if not groups:
-        return []
-    max_len = max(len(g) for g in groups)
-    fronts = []
-    for k in range(max_len):
-        front = np.array([g[k] for g in groups if len(g) > k], dtype=int)
-        fronts.append(front)
-    return fronts
+def _cosine(A, W):
+    """1 - pdist2(A, W, 'cosine')."""
+    na = np.maximum(np.linalg.norm(A, axis=1, keepdims=True), EPS)
+    nw = np.maximum(np.linalg.norm(W, axis=1, keepdims=True), EPS)
+    return (A / na) @ (W / nw).T
 
 
-def _compute_levels(Fn, n_p):
-    """Bin each objective independently (0..n_p-1); the level is the largest bin over objectives (larger is worse)."""
-    bins = np.floor(np.clip(Fn, 0.0, 1.0 - 1e-9) * n_p).astype(int)
-    return bins.max(axis=1)
+def _pareto_matrix(F):
+    """R[i, j] = 1: i Pareto-dominates j; -1: j dominates i; 0: non-dominated or equal."""
+    less = (F[:, None, :] < F[None, :, :])
+    more = (F[:, None, :] > F[None, :, :])
+    any_less, any_more = less.any(axis=2), more.any(axis=2)
+    R = np.zeros((len(F), len(F)), dtype=np.int8)
+    R[any_less & ~any_more] = 1
+    R[any_more & ~any_less] = -1
+    return R
 
 
-def _lpd_fronts(F, level):
-    n = F.shape[0]
-    M = pareto_relation_matrix(F)
-    for i in range(n):
-        for j in range(i + 1, n):
-            if M[i, j] != 0:
+def spd_sort(PopObj, d1, d2, RP, n_sort):
+    """SPDSort.m: returns (FrontNo, MaxFNo); unsorted solutions keep FrontNo = inf. Same comparison order and early exit as the original."""
+    N = len(PopObj)
+    R = _pareto_matrix(PopObj)
+    pbi = d1 + 5.0 * d2
+    same = RP[:, None] == RP[None, :]
+    tie = (R == 0) & same
+    R = R.copy()
+    R[tie & (pbi[:, None] < pbi[None, :])] = 1
+    R[tie & (pbi[:, None] > pbi[None, :])] = -1
+    FrontNo = np.full(N, np.inf)
+    MaxFNo = 0
+    while np.sum(FrontNo < np.inf) < min(n_sort, N):
+        MaxFNo += 1
+        D = FrontNo != np.inf
+        for i in range(N):
+            if D[i]:
                 continue
-            if level[i] < level[j]:
-                M[i, j], M[j, i] = 1, -1
-            elif level[j] < level[i]:
-                M[i, j], M[j, i] = -1, 1
-    return fast_non_dominated_sort_from_matrix(M)
-
-
-def compute_stage_state(F, ref_dirs, i_stage, n_p, theta=THETA_PBI):
-    """
-    Returns (rank, diversity_score, assoc).
-    Stage 1: diversity_score = d2 (smaller is better); stage 2: diversity_score = sub-region density SD (smaller is better).
-    """
-    Fn = normalize_ideal_nadir(F)
-    assoc = associate_to_reference_points(Fn, ref_dirs)
-
-    if i_stage == 1:
-        _, d2, pbi = _compute_pbi(Fn, assoc, ref_dirs, theta)
-        fronts = _spd_fronts(assoc, pbi, len(ref_dirs))
-        rank = rank_from_fronts(fronts, len(F)) if fronts else np.zeros(len(F), dtype=int)
-        return rank, d2, assoc, fronts
-    else:
-        level = _compute_levels(Fn, n_p)
-        fronts = _lpd_fronts(F, level)
-        rank = rank_from_fronts(fronts, len(F))
-        counts = np.bincount(assoc, minlength=len(ref_dirs))
-        sd = counts[assoc].astype(float)
-        return rank, sd, assoc, fronts
-
-
-def current_stage(n_gen, max_gen, n_obj, eta=ETA_STAGE):
-    threshold = (1 - 3 / (eta * n_obj)) * max_gen
-    return 1 if n_gen < threshold else 2
-
-
-class TSTournament:
-    """Algorithm 3: compare front index (CM), then the diversity measure (DM, smaller is better), then pick at random."""
-
-    def __init__(self, ref_dirs, max_gen, n_p, theta=THETA_PBI, eta=ETA_STAGE):
-        self.ref_dirs = ref_dirs
-        self.max_gen = max(int(max_gen), 1)
-        self.n_p = n_p
-        self.theta = theta
-        self.eta = eta
-
-    def __call__(self, pop, P, algorithm, **kwargs):
-        F = pop.get("F").astype(float, copy=False)
-        n_gen = getattr(algorithm, "n_gen", None) or 0
-        n_obj = F.shape[1]
-        i_stage = current_stage(n_gen, self.max_gen, n_obj, self.eta)
-        rank, dm, _assoc, _fronts = compute_stage_state(F, self.ref_dirs, i_stage, self.n_p, self.theta)
-
-        n_tournaments, n_parents = P.shape
-        if n_parents != 2:
-            raise ValueError("TSTournament only supports binary tournaments")
-        S = np.full(n_tournaments, -1, dtype=int)
-        for i in range(n_tournaments):
-            a, b = P[i, 0], P[i, 1]
-            if rank[a] < rank[b]:
-                S[i] = a
-            elif rank[b] < rank[a]:
-                S[i] = b
-            elif dm[a] < dm[b]:
-                S[i] = a
-            elif dm[b] < dm[a]:
-                S[i] = b
+            cand = np.flatnonzero(~D[i + 1:]) + i + 1
+            r = R[i, cand]
+            neg = np.flatnonzero(r == -1)
+            if len(neg):
+                stop = neg[0]
+                D[cand[:stop][r[:stop] == 1]] = True
+                D[i] = True
             else:
-                S[i] = a if np.random.rand() < 0.5 else b
-        return S[:, None]
+                D[cand[r == 1]] = True
+            if not D[i]:
+                FrontNo[i] = MaxFNo
+        if not np.any(FrontNo == MaxFNo):  # guard: a pass that assigns nobody (dominance cycle) would loop forever in the original
+            FrontNo[FrontNo == np.inf] = MaxFNo
+    return FrontNo, MaxFNo
+
+
+def environmental_selection(F, W, N):
+    """EnvironmentalSelection.m: returns (selected indices, their FrontNo, their d2)."""
+    P = _minmax(F)
+    normP = np.linalg.norm(P, axis=1)
+    cos = np.clip(_cosine(P, W), -1.0, 1.0)
+    d1_all = normP[:, None] * cos
+    d2_all = normP[:, None] * np.sqrt(np.maximum(1.0 - cos ** 2, 0.0))
+    RP = np.argmin(d2_all, axis=1)
+    d2 = d2_all[np.arange(len(P)), RP]
+    d1 = d1_all[np.arange(len(P)), RP]
+    ND = NonDominatedSorting().do(P, only_non_dominated_front=True)
+    ext = ND[np.argmax(P[ND], axis=0)]
+    d1[ext] = 0.0
+    d2[ext] = 0.0
+    FrontNo, MaxFNo = spd_sort(P, d1, d2, RP, N)
+    nxt = FrontNo < MaxFNo
+    last = np.flatnonzero(FrontNo == MaxFNo)
+    order = np.argsort(d2[last], kind="stable")
+    nxt[last[order[: N - int(nxt.sum())]]] = True
+    idx = np.flatnonzero(nxt)
+    return idx, FrontNo[idx], d2[idx]
+
+
+def level_sort(F, n):
+    """LevelSort.m: level t = smallest t >= 1 with every objective <= Zmin + (t + 1) * interval."""
+    zmax, zmin = F.max(axis=0), F.min(axis=0)
+    interval = (zmax - zmin) / n
+    level = np.zeros(len(F), dtype=int)
+    for i, obj in enumerate(F):
+        t = 0
+        while True:
+            t += 1
+            # guard: t never exceeds n in exact arithmetic; the original loops forever if the interval underflows to 0
+            if np.all(obj <= zmin + (t + 1) * interval) or t >= n:
+                break
+        level[i] = t
+    return level
+
+
+def density_estimate(F, W):
+    """DensityEstimate.m: number of solutions in the sub-region (largest cosine) of each solution."""
+    region = np.argmax(_cosine(_minmax(F), W), axis=1)
+    return np.bincount(region, minlength=len(W))[region].astype(float)
+
+
+def environmental_selection1(F, W, N, M):
+    """EnvironmentalSelection1.m: returns the selected indices in the order of the reference vectors."""
+    fronts = NonDominatedSorting().do(F)
+    pool = []
+    for fr in fronts:
+        pool.extend(fr.tolist())
+        if len(pool) >= N:
+            break
+    pool = np.array(pool, dtype=int)
+    n = 2 * M
+    lev = level_sort(F[pool], n)
+    # levels 1..n are concatenated; in the original code the early exit never triggers
+    pool = np.concatenate([pool[lev == i] for i in range(1, n + 1)])
+    selected = []
+    remaining = list(pool)
+    for w in W:
+        if not remaining:
+            break
+        S = _minmax(F[remaining])
+        k = int(np.argmax(_cosine(S, w[None, :])[:, 0]))
+        selected.append(remaining.pop(k))
+    return np.array(selected, dtype=int)
 
 
 class TSSurvival(Survival):
-    def __init__(self, ref_dirs, max_gen, n_p, theta=THETA_PBI, eta=ETA_STAGE):
+    def __init__(self, ref_dirs, max_eval):
         super().__init__(filter_infeasible=True)
-        self.ref_dirs = ref_dirs
-        self.max_gen = max(int(max_gen), 1)
-        self.n_p = n_p
-        self.theta = theta
-        self.eta = eta
+        self.W = ref_dirs
+        self.max_eval = max(int(max_eval), 1)
 
-    def _do(self, problem, pop, *args, n_survive=None, algorithm=None, random_state=None, **kwargs):
+    def _do(self, problem, pop, *args, n_survive=None, algorithm=None, **kwargs):
         F = pop.get("F").astype(float, copy=False)
-        n_gen = getattr(algorithm, "n_gen", None) or 0
-        n_obj = F.shape[1]
-        i_stage = current_stage(n_gen, self.max_gen, n_obj, self.eta)
-        rank, diversity, assoc, fronts = compute_stage_state(F, self.ref_dirs, i_stage, self.n_p, self.theta)
-
-        if i_stage == 1:
-            # fill exactly n_survive; the last front is truncated by ascending d2 (Algorithm 2, lines 15-19)
-            survivors = []
-            for front in fronts:
-                if len(survivors) + len(front) > n_survive:
-                    n_remove = len(survivors) + len(front) - n_survive
-                    front = truncate_by_score(front, diversity[front], n_remove, prefer="smallest", random_state=random_state)
-                survivors.extend(front.tolist())
-                if len(survivors) >= n_survive:
-                    break
-            for r, front in enumerate(fronts):
-                for gi in front:
-                    if int(gi) in survivors:
-                        pop[int(gi)].set("rank", r)
-                        pop[int(gi)].set("crowding", -diversity[int(gi)])
-            return pop[survivors]
-
-        # stage 2: accumulate whole fronts until size >= n_survive (may exceed it; Algorithm 2, lines 11-14)
-        pool = []
-        for front in fronts:
-            pool.extend(front.tolist())
-            if len(pool) >= n_survive:
-                break
-        pool = np.array(pool, dtype=int)
-
-        # then pick the best-aligned solution from the pool for each reference direction until n_survive are chosen (Algorithm 2, lines 20-27)
-        Fn_pool = normalize_ideal_nadir(F[pool])
-        remaining_mask = np.ones(len(pool), dtype=bool)
-        selected = []
-        ref_norms = np.maximum(np.linalg.norm(self.ref_dirs, axis=1), 1e-12)
-        for w, w_norm in zip(self.ref_dirs, ref_norms):
-            if not remaining_mask.any() or len(selected) >= n_survive:
-                break
-            idx_remaining = np.where(remaining_mask)[0]
-            fn_remaining = Fn_pool[idx_remaining]
-            fn_norms = np.maximum(np.linalg.norm(fn_remaining, axis=1), 1e-12)
-            cos = (fn_remaining @ w) / (fn_norms * w_norm)
-            best_local = idx_remaining[np.argmax(cos)]  # argmax = best aligned, see module docstring
-            selected.append(pool[best_local])
-            remaining_mask[best_local] = False
-
-        # fewer reference directions than remaining slots (cannot happen when |W| = n_survive); fill up
-        if len(selected) < n_survive:
-            leftover = pool[remaining_mask][: n_survive - len(selected)]
-            selected.extend(leftover.tolist())
-
-        for gi in selected:
-            pop[int(gi)].set("rank", 0)
-            pop[int(gi)].set("crowding", 0.0)
-        return pop[selected]
+        M = F.shape[1]
+        fe = algorithm.evaluator.n_eval if algorithm is not None and algorithm.evaluator is not None else 0
+        if fe < (0.8 + 0.2 * (1 - 3 / M)) * self.max_eval:
+            idx, front_no, d2 = environmental_selection(F, self.W, n_survive)
+        else:
+            idx = environmental_selection1(F, self.W, n_survive, M)
+            sub = F[idx]
+            front_no = np.empty(len(idx))
+            for r, fr in enumerate(NonDominatedSorting().do(sub)):
+                front_no[fr] = r + 1
+            d2 = density_estimate(sub, self.W)
+        out = pop[idx]
+        # binary tournament (comp_by_rank_and_crowding): lower rank wins, then larger crowding, so -d2 is stored;
+        # pymoo takes rank == 0 as the final set, PlatEMO's FrontNo starts at 1, hence the shift
+        for k, ind in enumerate(out):
+            ind.set("rank", front_no[k] - 1)
+            ind.set("crowding", -d2[k])
+        return out
 
 
 class TS_NSGA2(NSGA2):
-    def __init__(self, ref_dirs, max_gen=100, n_p=None, theta=THETA_PBI, eta=ETA_STAGE, **kwargs):
-        n_obj_hint = ref_dirs.shape[1]
-        n_p = n_p or (2 * n_obj_hint)
-        pop_size = len(ref_dirs)
-        selection = TournamentSelection(func_comp=TSTournament(ref_dirs, max_gen, n_p, theta, eta))
-        survival = TSSurvival(ref_dirs, max_gen, n_p, theta, eta)
-        super().__init__(pop_size=pop_size, selection=selection, survival=survival, **kwargs)
+    """Population size = number of reference vectors (PlatEMO: [W, Problem.N] = UniformPoint(N, M)); max_eval = maxFE."""
+
+    def __init__(self, ref_dirs, max_eval, **kwargs):
+        super().__init__(pop_size=len(ref_dirs), survival=TSSurvival(ref_dirs, max_eval), **kwargs)
+        self.tournament_type = "comp_by_rank_and_crowding"
