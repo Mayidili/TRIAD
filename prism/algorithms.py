@@ -1,6 +1,7 @@
 """
-Search algorithms: NSGA-II and three NSGA-II variants (CSDR, TS-NSGA-II, RPS-NSGA-II),
-implemented from the formulas in the original papers (see prism/ec/).
+Search algorithms: NSGA-II and three NSGA-II variants (CSDR, TS-NSGA-II, RPS-NSGA-II), see prism/ec/.
+NSGA-II/CSDR and RPS-NSGA-II are implemented from the original papers; TS-NSGA-II is a port of the
+reference implementation in PlatEMO (BIMK/PlatEMO, Algorithms/Multi-objective optimization/TS-NSGA-II).
 
 NSGA-II and CSDR take pop_size directly. For TS-NSGA-II and RPS-NSGA-II the population
 size equals the number of reference directions and cannot be set independently;
@@ -34,10 +35,9 @@ def _build_ref_dirs(n_obj=N_OBJ):
 
 def build_algorithm(name, pop_size=POP_SIZE, n_obj=N_OBJ, n_eval=N_EVAL_DEFAULT, **kwargs):
     """
-    n_eval is used to estimate max_gen, which drives the parameter annealing of CSDR and the
-    stage switch of TS-NSGA-II; pass the same n_eval as the termination criterion.
-    max_gen is computed from the effective population size: for TSNSGA2/RPS this is the
-    number of reference directions, not pop_size.
+    n_eval is the total number of evaluations; pass the same value as the termination criterion.
+    It sets max_gen for the parameter annealing of CSDR and the evaluation budget (maxFE) that
+    drives the stage switch of TS-NSGA-II.
     """
     if name == "NSGA2":
         return NSGA2(pop_size=pop_size, **kwargs)
@@ -46,8 +46,7 @@ def build_algorithm(name, pop_size=POP_SIZE, n_obj=N_OBJ, n_eval=N_EVAL_DEFAULT,
         return NSGA2_CSDR(pop_size=pop_size, max_gen=max_gen, **kwargs)
     if name == "TSNSGA2":
         ref_dirs = _build_ref_dirs(n_obj)
-        max_gen = max(n_eval // len(ref_dirs), 1)
-        return TS_NSGA2(ref_dirs=ref_dirs, max_gen=max_gen, **kwargs)
+        return TS_NSGA2(ref_dirs=ref_dirs, max_eval=n_eval, **kwargs)
     if name == "RPS":
         ref_dirs = _build_ref_dirs(n_obj)
         return RPS_NSGA2(ref_dirs=ref_dirs, **kwargs)
