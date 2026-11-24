@@ -39,7 +39,7 @@ A feature counts only when both its own gene and its group gene exceed 0.5. A gr
 **Highlights**
 
 - **Joint encoding** of filter bank, radiomic + contrast-kinetic features and classifier regularization.
-- **Four NSGA-II variants** (NSGA-II, NSGA-II/CSDR, TS-NSGA-II, RPS-NSGA-II), implemented on pymoo.
+- **Four NSGA-II variants** (NSGA-II, NSGA-II/CSDR, TS-NSGA-II, RPS-NSGA-II), implemented on pymoo. TS-NSGA-II is a port of the reference implementation in [PlatEMO](https://github.com/BIMK/PlatEMO) (Tian Y, Cheng R, Zhang X, Jin Y. PlatEMO: A MATLAB platform for evolutionary multi-objective optimization. *IEEE Computational Intelligence Magazine* 2017;12(4):73–87).
 - **Leakage-free evaluation**: the entire search is nested inside five-fold cross-validation, and the staged baselines (LASSO, mRMR, elastic net, RFE, all features) are evaluated on the same outer folds.
 - **Matched-budget ablations**: random search, no filter genes, sequential feature-then-C search.
 - **Frozen external validation** on the I-SPY1 and I-SPY2 trials, with an audit of feature order, label coding and model serialization.
